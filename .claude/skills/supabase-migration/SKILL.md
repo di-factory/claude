@@ -22,7 +22,16 @@ Read `CLAUDE.md` for the project conventions (money, location, identity). The sc
 4. **Write or extend pgTAP tests** in `supabase/tests/` for every policy you added or changed, then run `supabase test db`.
 5. **Regenerate TypeScript types:** `supabase gen types typescript --local > apps/web/src/lib/database.types.ts`.
 6. **Update the SQLAlchemy models** in `apps/api/app/db/models/` so they mirror the new schema. There is no Alembic: SQLAlchemy never generates or runs migrations here.
-7. **Check advisors.** Use the Supabase MCP `get_advisors` tool if it is connected, otherwise `supabase db lint`. Fix security warnings (tables without RLS, mutable `search_path`) before finishing.
+7. **Check security.** `supabase db lint` only checks PL/pgSQL errors, not RLS. Run these queries against the local database, and expect every one to return no rows:
+   ```sql
+   -- tables in exposed schemas without RLS
+   select n.nspname, c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace
+   where c.relkind = 'r' and n.nspname = 'public' and not c.relrowsecurity;
+   -- SECURITY DEFINER functions in exposed schemas, or without a fixed search_path
+   select n.nspname, p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where p.prosecdef and (n.nspname = 'public' or not coalesce(p.proconfig::text like '%search_path=%', false));
+   ```
+   Against a hosted project, also run the Supabase MCP `get_advisors` tool (security and performance) when it is connected, and fix what it reports.
 8. **Summarize** the change for the PR. List the policies added and any destructive steps.
 
 If the Supabase stack can't run (no CLI, or Docker can't pull its images), fall back to a throwaway Postgres with the `postgis`, `vector` and `pgtap` extensions:
@@ -37,6 +46,15 @@ If even that isn't possible, still write the migration and tests, then say clear
 ### Tables and columns
 - `id uuid primary key default gen_random_uuid()`, `created_at timestamptz not null default now()`, `updated_at timestamptz not null default now()` maintained by the shared `set_updated_at()` trigger. Create that trigger function in the first migration that needs it.
 - Brokers are 1:1 with `auth.users`. `public.brokers.id` references `auth.users(id)`, so `broker_id` columns compare directly to `auth.uid()`.
+- **Brokers must never be able to write fields that grant them something.** RLS controls rows, not columns: an owner who may update their `brokers` row could otherwise set their own verification to approved and skip verified onboarding (scope §2). Keep such fields in tables that brokers can't write:
+  - verification: `public.broker_verifications(broker_id, status, reviewed_by, reviewed_at, notes)`, where brokers can only `select` their own row and only admins or the service role write;
+  - job state: see below;
+  - admin flags.
+
+  Prefer a separate table over column-level grants, which also break ORM inserts that list every column.
+- **SEPOMEX catalog:**
+  - `public.cities(id, name, state_code)` and `public.colonias(id, name, postal_code, city_id, settlement_type)`, readable by `authenticated` and writable by nobody through the API;
+  - the data is loaded by an import script (`supabase/seed.sql` for local development, an Inngest job or admin script for production), never embedded in migrations.
 - Money: `<name>_cents bigint check (<name>_cents >= 0)` plus `currency char(3) check (currency in ('MXN','USD'))`. Add `not null` when the value is mandatory (a listing's price, scope §5). Leave it nullable when it's optional (a saved search's budget), with a check that the currency is set whenever the amount is.
 - Areas: `numeric(10,2)`, in m².
 - Location of a listing: `location extensions.geography(Point, 4326)` plus `colonia_id` referencing the SEPOMEX catalog table, and `city_id`.
@@ -51,11 +69,17 @@ If even that isn't possible, still write the migration and tests, then say clear
 - Write one policy per command (`select`, `insert`, `update`, `delete`) and target `to authenticated`.
 - Supabase grants table privileges to `anon` by default. Add `revoke all on table public.x from anon;` so a missing policy can't expose data to logged-out requests. The scope has no public data today.
 - Wrap auth calls in a subselect, `(select auth.uid())`, so Postgres evaluates them once per query instead of once per row.
-- Verified-broker gate: posting and searching require an approved broker (scope §2). Use the helper `public.is_verified_broker()`, a `stable` `security definer` function with `set search_path = ''` that checks `public.brokers.verification_status = 'approved'` for `auth.uid()`. Create it in the first migration that needs it; don't copy its logic into every policy.
+- Verified-broker gate: posting and searching require an approved broker (scope §2). Use the helper `private.is_verified_broker()`:
+  - a `stable` `security definer` function with `set search_path = ''`;
+  - it checks `public.broker_verifications.status = 'approved'` for `auth.uid()`;
+  - it lives in the `private` schema, which isn't exposed through the Data API, so it can't be called or abused as an RPC endpoint;
+  - grant `usage on schema private` and `execute` on the function to `authenticated`.
+
+  Create it in the first migration that needs it; don't copy its logic into every policy.
 - Ownership (scope §4): `update` and `delete` on listings use `using (broker_id = (select auth.uid()))`, and `update` also has `with check (broker_id = (select auth.uid()))` so ownership can't be transferred.
 - Visibility: other brokers see only `available` / `under_offer` listings. Owners also see their own `closed` and `archived` rows.
 - Conversations and leads (scope §3.3, §3.5, §11): visible only to participants, via `exists (select 1 from public.thread_participants p where p.thread_id = <table>.thread_id and p.broker_id = (select auth.uid()))`.
-- Storage buckets need their own policies on `storage.objects`. Listing photos: the owner writes under a `<broker_id>/<listing_id>/` prefix; verified brokers can read.
+- Storage buckets need their own policies on `storage.objects`. Listing photos: the owner writes under a `<broker_id>/<listing_id>/` prefix; verified brokers can read. Supabase blocks direct SQL deletes on `storage.objects`, so test the `select`/`insert` storage policies in pgTAP, and test deletes through the Storage API in an API integration test.
 
 ### Indexes
 - Index every foreign key and every column used in a policy predicate. Policies run on every query, so a missing index here slows down everything.
@@ -84,7 +108,10 @@ select plan(3);
 insert into auth.users (id, email) values
   ('00000000-0000-0000-0000-00000000000a', 'owner@test.mx'),
   ('00000000-0000-0000-0000-00000000000b', 'other@test.mx');
-insert into public.brokers (id, verification_status) values
+insert into public.brokers (id) values
+  ('00000000-0000-0000-0000-00000000000a'),
+  ('00000000-0000-0000-0000-00000000000b');
+insert into public.broker_verifications (broker_id, status) values
   ('00000000-0000-0000-0000-00000000000a', 'approved'),
   ('00000000-0000-0000-0000-00000000000b', 'approved');
 insert into public.listings (id, broker_id, status, price_cents, currency /*, ...other required columns */) values
