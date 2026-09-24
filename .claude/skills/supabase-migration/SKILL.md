@@ -25,22 +25,31 @@ Read `CLAUDE.md` for the project conventions (money, location, identity). The sc
 7. **Check advisors.** Use the Supabase MCP `get_advisors` tool if it is connected, otherwise `supabase db lint`. Fix security warnings (tables without RLS, mutable `search_path`) before finishing.
 8. **Summarize** the change for the PR. List the policies added and any destructive steps.
 
-If the local stack can't run (no Docker, no CLI), still write the migration and tests, then say clearly which steps you couldn't run.
+If the Supabase stack can't run (no CLI, or Docker can't pull its images), fall back to a throwaway Postgres with the `postgis`, `vector` and `pgtap` extensions:
+1. Stub what Supabase provides: the `auth` schema with `auth.users`, the `auth.uid()` function reading `request.jwt.claims`, and the `anon`, `authenticated` and `service_role` roles.
+2. Apply the migrations in order.
+3. Run the tests with `pg_prove`.
+
+If even that isn't possible, still write the migration and tests, then say clearly which steps you couldn't run.
 
 ## SQL checklist
 
 ### Tables and columns
 - `id uuid primary key default gen_random_uuid()`, `created_at timestamptz not null default now()`, `updated_at timestamptz not null default now()` maintained by the shared `set_updated_at()` trigger. Create that trigger function in the first migration that needs it.
 - Brokers are 1:1 with `auth.users`. `public.brokers.id` references `auth.users(id)`, so `broker_id` columns compare directly to `auth.uid()`.
-- Money: `<name>_cents bigint not null check (<name>_cents >= 0)` plus `currency char(3) not null check (currency in ('MXN','USD'))`.
+- Money: `<name>_cents bigint check (<name>_cents >= 0)` plus `currency char(3) check (currency in ('MXN','USD'))`. Add `not null` when the value is mandatory (a listing's price, scope §5). Leave it nullable when it's optional (a saved search's budget), with a check that the currency is set whenever the amount is.
 - Areas: `numeric(10,2)`, in m².
-- Location: `location extensions.geography(Point, 4326)` plus `colonia_id` referencing the SEPOMEX catalog table, and `city_id`. Never use free-text zone columns as the filter source.
+- Location of a listing: `location extensions.geography(Point, 4326)` plus `colonia_id` referencing the SEPOMEX catalog table, and `city_id`.
+- Location of a search or preference (e.g. "Condesa o Roma Norte"): a join table such as `demand_colonias(demand_id, colonia_id)`, not an array or free text, so it can be indexed and joined.
+- Never use free-text zone columns as the filter source.
+- Job-owned state (embedding status, content hashes, matching status, last errors) goes in its own table, such as `listing_embeddings` or `listing_job_state`. On the owner's table, every job write would bump `updated_at`, and the owner's update policy would let brokers edit it. Brokers get `select` on these tables at most.
 - Closed vocabularies (operation type, property type, listing status) are Postgres enums or check constraints. Values are lowercase English identifiers (`rent`, `sale`, `apartment`); the UI maps them to Spanish.
-- Mark columns that may hold personal data with a column comment starting `PII:`, e.g. `comment on column public.leads.note is 'PII: may contain end-client details'`. The `privacy-review` skill relies on these markers.
+- Mark columns that may hold personal data with a column comment starting `PII:`, e.g. `comment on column public.leads.note is 'PII: may contain end-client details'`. When you add such a column, also run the `privacy-review` skill on the change. Prefer not adding it at all: saved searches store requirements, never the client's name or phone.
 
 ### Row-Level Security
 - Enable RLS in the same migration that creates the table: `alter table public.x enable row level security;`. A table without RLS is exposed through the Data API to every logged-in user.
-- Write one policy per command (`select`, `insert`, `update`, `delete`) and target `to authenticated`. Grant nothing to `anon` unless the scope explicitly calls for public data (it currently doesn't).
+- Write one policy per command (`select`, `insert`, `update`, `delete`) and target `to authenticated`.
+- Supabase grants table privileges to `anon` by default. Add `revoke all on table public.x from anon;` so a missing policy can't expose data to logged-out requests. The scope has no public data today.
 - Wrap auth calls in a subselect, `(select auth.uid())`, so Postgres evaluates them once per query instead of once per row.
 - Verified-broker gate: posting and searching require an approved broker (scope §2). Use the helper `public.is_verified_broker()`, a `stable` `security definer` function with `set search_path = ''` that checks `public.brokers.verification_status = 'approved'` for `auth.uid()`. Create it in the first migration that needs it; don't copy its logic into every policy.
 - Ownership (scope §4): `update` and `delete` on listings use `using (broker_id = (select auth.uid()))`, and `update` also has `with check (broker_id = (select auth.uid()))` so ownership can't be transferred.
@@ -64,6 +73,8 @@ Dropping or renaming columns and tables, or narrowing types, breaks the API and 
 ## pgTAP test template
 
 RLS updates by a non-owner don't raise errors; they silently affect zero rows. So tests switch back to the superuser and confirm the data is unchanged. Inserts that violate a policy do raise SQLSTATE `42501`.
+
+Put one file per table in `supabase/tests/`, named `<table>_rls.test.sql`. The pgTAP extension must exist before the tests run; create it in the first test file (or in a `000_setup.test.sql`) with `create extension if not exists pgtap with schema extensions;`.
 
 ```sql
 begin;

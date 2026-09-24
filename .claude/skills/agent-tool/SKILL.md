@@ -1,6 +1,6 @@
 ---
 name: agent-tool
-description: Add or change a tool that the grap-ia chat agent (Claude via the Anthropic Python SDK Tool Runner in apps/api) can call - listing creation/editing, search, status changes, saved demand, connecting brokers, leads, or any new broker action exposed to the agent. Use this whenever the task involves what the agent can do, how it extracts listing fields from Spanish broker messages, tool arguments or descriptions, tool authorization, or agent eval cases, even if phrased as a product request like "let brokers mark a property as rented from the chat" or "the bot should be able to show my leads".
+description: Add or change a tool that the grap-ia chat agent (Claude via the Anthropic Python SDK Tool Runner in apps/api) can call - listing drafting/publishing/editing, search, status changes, saved demand, connecting brokers, leads, or any new broker action exposed to the agent. Use this whenever the task involves what the agent can do, how it extracts listing fields from Spanish broker messages, tool arguments or descriptions, tool authorization, or agent eval cases, even if phrased as a product request like "let brokers mark a property as rented from the chat" or "the bot should be able to show my leads".
 ---
 
 # grap-ia agent tools
@@ -18,21 +18,29 @@ Read `CLAUDE.md` for the conventions and glossary, and `scope.md` §3-§5 for wh
 ## Where things live
 
 ```
-apps/api/app/agent/runner.py      client, model, system prompt, runner config (shared by all tools)
-apps/api/app/agent/context.py     AgentContext: broker_id, is_verified, db session (under the broker's claims), request_id
+apps/api/app/agent/runner.py           client, model, system prompt, runner config (shared by all tools)
+apps/api/app/agent/context.py          AgentContext: broker_id, is_verified, db session (under the broker's claims), request_id
 apps/api/app/agent/tools/<domain>.py   tool factories, e.g. listings.py, search.py, demand.py, chat.py
 apps/api/app/services/<domain>.py      business logic the tools call
-apps/api/tests/                   pytest
-apps/api/evals/agent/<tool>.jsonl eval cases for the agent
+apps/api/tests/                        pytest
+apps/api/evals/agent/<tool>.jsonl      eval cases for the agent
 ```
 
 If a directory doesn't exist yet, create it in this shape.
+
+If the tool needs new tables or columns, write the migration with the `supabase-migration` skill first. Services and tools are written against the schema, not the other way around.
 
 ## Design rules
 
 **One tool per business action a broker would recognize.** Name it `verb_noun` (`search_listings`, `set_listing_status`, `save_demand`, `connect_brokers`). Prefer a few clear tools over one tool with a `mode` argument, because the model picks tools by their description.
 
-**The tool is an adapter; the logic lives in a service.** The tool function validates arguments, calls `app/services/...` and formats the result. Tests and other callers (REST endpoints, jobs) use the service directly, which keeps behavior identical whether an action comes from chat or the UI.
+**Give the agent a way to find what it acts on.** A tool that takes an ID is useless unless another tool returns that ID. Brokers say "el depa de Narvarte", not a UUID. Pair every action on an existing entity with a lookup the agent can call first, e.g. `list_my_listings(colonia=..., operation=..., status=...)` before `set_listing_status`. When the lookup returns several candidates, the agent asks which one.
+
+**The tool is an adapter; the logic lives in a service.** The tool function maps arguments, calls `app/services/...` and formats the result. Authorization lives in the service, so every caller gets the same rules:
+- the verified-broker check (scope §2);
+- ownership checks (scope §4).
+
+Callers include the agent, REST endpoints and jobs. The DB session runs under the broker's JWT claims, so RLS backs this up without replacing it. The tool itself doesn't re-implement the checks.
 
 **The docstring is the prompt.** The SDK sends the function's docstring as the tool description and the `Args:` section as parameter descriptions. State:
 - what the tool does, when to use it and when not to;
@@ -41,28 +49,41 @@ If a directory doesn't exist yet, create it in this shape.
 
 Include the Spanish words brokers actually use ("renta", "recámaras", "colonia", "28 mil"), so the model maps "depa de 2 rec en la Roma" to the right arguments.
 
-**Identity and permissions come from `AgentContext`, never from arguments.** Never add a `broker_id` parameter. Check `ctx.is_verified` for any tool that posts or searches (scope §2), and check ownership for mutations (scope §4). The DB session runs under the broker's JWT claims, so RLS backs up these checks; it doesn't replace them.
+**Identity comes from `AgentContext`, never from arguments.** Never add a `broker_id` parameter. The broker is always `ctx.broker_id`.
 
-**Mutations need explicit confirmation (scope §3.1).** Use draft → confirm:
-- `draft_listing` validates and saves a draft, and returns the normalized fields plus any missing mandatory ones;
-- the agent shows the broker a summary;
-- only after the broker says yes does it call `publish_listing(draft_id)`.
+**Confirmation is enforced in code for actions that affect others or can't be easily undone:**
+- publishing a listing;
+- changing a listing's status (it disappears from or reappears in other brokers' searches);
+- archiving/deleting;
+- `connect_brokers` (it contacts another broker).
 
-Apply the same pattern to deletions and status changes that hide a listing. Say in the docstring that the tool must only be called after the broker explicitly confirmed.
+Use draft → confirm with server-side state:
+1. The first tool (`draft_listing`, `propose_status_change`) validates, saves a pending record and returns a normalized summary plus a `pending_id`.
+2. The agent shows the summary and asks.
+3. Only the confirm tool (`publish_listing(pending_id)`, `confirm_status_change(pending_id)`) performs the change. The service rejects a pending record that is unknown, expired or belongs to another broker.
+
+The docstring still says to call the confirm tool only after an explicit "sí", but the rule lives in code, not only in the prompt.
+
+**Private, easily reversible actions** like saving a broker's own search (`save_demand`) can run directly, but the tool result must include a summary the agent reads back to the broker ("Guardé tu búsqueda: renta en Condesa, hasta $30,000, 2 recámaras").
 
 **Typed, normalized arguments.**
 - Use `Literal[...]` for closed vocabularies (operation `rent`/`sale`, property types).
-- Prices are numbers in whole currency units plus a currency code; convert to centavos inside the service.
-- Colonia is free text from the broker, resolved by the service against the SEPOMEX catalog. On ambiguity, return the candidates so the agent can ask ("¿Roma Norte o Roma Sur?").
+- Prices are numbers in whole currency units plus a currency code; the service converts to centavos.
+- Colonias are free text from the broker, resolved by the service against the SEPOMEX catalog. An exact or unambiguous match proceeds. A near match or several candidates ("Condesa" → Hipódromo Condesa, Condesa; "la Roma" → Roma Norte, Roma Sur) returns `candidates` and saves nothing, so the agent asks.
 - Mandatory listing fields are listed in scope §5.
 
 **Return what the model needs, nothing more.** Return compact JSON strings: IDs for follow-up calls, the normalized fields, short summaries. Never return another broker's contact details (the connection happens through `connect_brokers`) or any end-client data.
 
-**Expected failures are results, not exceptions.** Return `{"error": "...", "missing_fields": [...]}` or `{"error": "...", "candidates": [...]}` so the agent can ask the broker a precise question. Let only unexpected exceptions propagate.
+**Expected failures are results, not exceptions.** Return `{"error": "<code>", ...}` with what the agent needs to ask the next question: `missing_fields`, `candidates`, `broker_not_verified`, `pending_expired`. For an entity that doesn't exist and one owned by someone else, return the same `not_found`, so the tool never reveals other brokers' listings. Let only unexpected exceptions propagate.
 
-**Keep end-client data out (LFPDPPP, scope §11).** Brokers will write things like "para mi cliente Juan Pérez, 55 1234 5678, presupuesto 30 mil". Demand and listing records store requirements (budget, zone, bedrooms), never the client's identity. Descriptions that get embedded must not contain names or phone numbers. If a tool must handle such data, run the `privacy-review` skill.
+**Keep end-client data out (LFPDPPP, scope §11).** Brokers will write things like "para mi cliente Juan Pérez, 55 1234 5678, presupuesto 30 mil".
+- Demand and listing records store requirements (budget, zone, bedrooms), never the client's identity. Tool schemas have no fields for client names or contacts.
+- The docstring tells the model to leave those details out.
+- An eval case checks that they never appear in arguments.
 
-**Stay fast.** Chat tools should return in about a second. Embeddings, photo tagging, duplicate checks and match notifications are Inngest jobs: have the service emit an event after the commit (see the `inngest-job` skill) instead of doing the work inline.
+If a tool must handle such data, run the `privacy-review` skill.
+
+**Stay fast.** Chat tools should return in about a second. Embeddings, photo tagging, duplicate checks and match notifications are Inngest jobs: have the service emit the event after commit (e.g. `listing/published`, see the `inngest-job` skill) instead of doing the work inline.
 
 ## Code shape
 
@@ -79,44 +100,49 @@ from app.services import listings as listings_service
 
 def build_listing_tools(ctx: AgentContext) -> list:
     @beta_async_tool
-    async def set_listing_status(
+    async def propose_status_change(
         listing_id: str,
         status: Literal["available", "under_offer", "closed"],
     ) -> str:
-        """Change the status of one of the broker's own listings.
+        """Prepare a status change for one of the broker's own listings; nothing changes yet.
 
         Use when the broker says a property was rented/sold ("ya se rentó",
         "ya se vendió"), is under offer ("tiene apartado", "en negociación"),
-        or is available again. Closed listings drop out of other brokers'
-        searches. Only call this after the broker has explicitly confirmed
-        which listing and which new status.
+        or is available again. Get listing_id from list_my_listings first.
+        Returns a summary and a pending_id: show the summary, and only call
+        confirm_status_change after the broker explicitly agrees.
 
         Args:
-            listing_id: ID of the listing, as returned by earlier tool results.
+            listing_id: ID of the listing, from list_my_listings.
             status: New status: available, under_offer or closed.
         """
-        if not ctx.is_verified:
-            return '{"error": "broker_not_verified"}'
-        result = await listings_service.set_status(
+        result = await listings_service.propose_status_change(
             ctx.db, broker_id=ctx.broker_id, listing_id=listing_id, status=status
         )
         return result.model_dump_json()
 
-    return [set_listing_status]
+    return [propose_status_change]  # plus list_my_listings, confirm_status_change, ...
 ```
 
 Register the factory's tools in `runner.py`, where the runner is created per request with `tools=[*build_listing_tools(ctx), ...]`. Don't create a separate runner or client per tool.
 
 ## Tests and evals
 
-1. **Service tests (pytest):** the happy path, non-owner rejection, unverified-broker rejection, validation errors, and currency/area normalization.
-2. **Adapter test:** at least one test that builds the tools with a fake `AgentContext` and checks the tool's result JSON for success and for an expected error.
-3. **Eval cases:** add realistic Mexican Spanish broker messages to `apps/api/evals/agent/<tool>.jsonl`, one JSON object per line, with the expected tool and key arguments. Include slang, abbreviations and missing fields, e.g.:
+1. **Service tests (pytest)** against a test database: the happy path, a non-owner getting `not_found`, an unverified broker being rejected, validation errors, colonia ambiguity, currency/area normalization, and a pending record that is expired, reused or foreign.
+2. **Adapter test:** build the tools with a fake `AgentContext` (stub the service) and check the tool's result JSON for success and for one expected error.
+3. **Eval cases** in `apps/api/evals/agent/<tool>.jsonl`, one JSON object per line:
+   - `history` holds earlier turns for multi-turn flows;
+   - `expect_tool: null` marks cases where the agent should ask a question instead of calling a tool;
+   - `forbid_in_args` lists strings that must never appear in tool arguments.
+
+   Use realistic Mexican Spanish with slang, abbreviations and missing fields:
 
 ```json
 {"input": "tengo un depa en renta en la roma nte, 2 rec, 85m2, 28 mil + mantenimiento, 1 cajón", "expect_tool": "draft_listing", "expect_args": {"operation": "rent", "property_type": "apartment", "colonia": "Roma Norte", "bedrooms": 2, "built_m2": 85, "price": 28000, "currency": "MXN", "parking_spaces": 1}}
-{"input": "ya se rentó el de Narvarte", "expect_tool": "set_listing_status", "expect_args": {"status": "closed"}, "note": "agent must first confirm which listing if the broker has several in Narvarte"}
+{"input": "ya se rentó el de Narvarte", "expect_tool": "list_my_listings", "expect_args": {"colonia": "Narvarte"}}
+{"history": [{"role": "user", "content": "ya se rentó el de Narvarte"}, {"role": "assistant", "content": "Encontré tu depa en Narvarte Poniente de $18,000. ¿Lo marco como rentado?"}], "input": "sí", "expect_tool": "confirm_status_change"}
+{"input": "cámbiale el precio al de la Roma", "expect_tool": null, "note": "must ask for the new price (and which listing, if several)"}
 {"input": "busco casa en venta en Coyoacán hasta 9 millones, mínimo 3 recámaras, para mi cliente Laura Gómez", "expect_tool": "search_listings", "expect_args": {"operation": "sale", "property_type": "house", "max_price": 9000000, "min_bedrooms": 3}, "forbid_in_args": ["Laura", "Gómez"]}
 ```
 
-To build or run the eval harness, use the built-in `claude-api` skill's `build-eval` flow. Aim for at least 5 cases per tool, including one where the agent should ask a question instead of calling the tool.
+To build or run the eval harness (including how to replay `history`), use the built-in `claude-api` skill's `build-eval` flow. Aim for at least 5 cases per tool, including one where the agent should ask instead of acting.
